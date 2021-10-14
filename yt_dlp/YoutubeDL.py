@@ -28,6 +28,9 @@ import traceback
 import random
 import unicodedata
 
+import snappy
+import redis
+
 from string import ascii_letters
 
 from .compat import (
@@ -494,8 +497,13 @@ class YoutubeDL(object):
     _playlist_urls = set()
     _screen_file = None
 
-    def __init__(self, params=None, auto_init=True):
+    CACHE_KEY_PREFIX = 'ytd:'
+    def __init__(self, params=None, auto_init=True, refresh_cache=False):
         """Create a FileDownloader object with the given options."""
+        self.refresh_cache = refresh_cache
+        redis_url = os.environ.get("YOUTUBE_DL_REDIS")
+        self.redis_client = redis.Redis.from_url(redis_url)
+
         if params is None:
             params = {}
         self._ies = {}
@@ -637,6 +645,34 @@ class YoutubeDL(object):
 
         self.archive = set()
         preload_download_archive(self.params.get('download_archive'))
+
+    
+    def get_ie_result_cached(self, key):
+        value = self.redis_client.get(self.CACHE_KEY_PREFIX + key)
+        if value:
+            value = snappy.uncompress(value)
+            value = json.loads(value.decode())
+            return value
+        return None
+
+    def set_ie_result_cached(self, key, value):
+        if not value:
+            return
+
+        timeout = 60 * 60 * 5
+        value_str = json.dumps(value)
+        data = snappy.compress(value_str)
+        self.redis_client.set(self.CACHE_KEY_PREFIX + key, data, timeout)
+
+    def get_ie_result(self, url, ie):
+        if not self.refresh_cache:
+            ie_result_cached = self.get_ie_result_cached(key=url)
+        else:
+            ie_result_cached = None
+        ie_result = ie_result_cached if ie_result_cached else ie.extract(url)
+        if not ie_result_cached:
+            self.set_ie_result_cached(key=url, value=ie_result)
+        return ie_result
 
     def warn_if_short_id(self, argv):
         # short YouTube ID starting with dash?
@@ -1283,7 +1319,8 @@ class YoutubeDL(object):
 
     @__handle_extraction_exceptions
     def __extract_info(self, url, ie, download, extra_info, process):
-        ie_result = ie.extract(url)
+        # ie_result = ie.extract(url)
+        ie_result = self.get_ie_result(url, ie)
         if ie_result is None:  # Finished already (backwards compatibility; listformats and friends should be moved here)
             return
         if isinstance(ie_result, list):
